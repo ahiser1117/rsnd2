@@ -1025,7 +1025,7 @@ fn uncompressed_pixel_bytes_per_plane(attributes: &ImageAttributes) -> Option<u6
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_free_string(ptr: *mut c_char) {
+pub extern "C" fn rsnd2_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             drop(CString::from_raw(ptr));
@@ -1034,17 +1034,17 @@ pub extern "C" fn nd2_rs_free_string(ptr: *mut c_char) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_free_buffer(buffer: Nd2Buffer) {
+pub extern "C" fn rsnd2_free_buffer(buffer: Nd2Buffer) {
     if !buffer.ptr.is_null() && buffer.len > 0 {
         unsafe {
             drop(Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.len));
         }
     }
-    nd2_rs_free_string(buffer.error);
+    rsnd2_free_string(buffer.error);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_version_probe_json(path: *const c_char) -> *mut c_char {
+pub extern "C" fn rsnd2_version_probe_json(path: *const c_char) -> *mut c_char {
     ffi_string_result(path, |path| {
         let probe = Nd2VersionProbe::open(path)?;
         Ok(version_probe_json(&probe))
@@ -1052,7 +1052,7 @@ pub extern "C" fn nd2_rs_version_probe_json(path: *const c_char) -> *mut c_char 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_summary_json(path: *const c_char) -> *mut c_char {
+pub extern "C" fn rsnd2_summary_json(path: *const c_char) -> *mut c_char {
     ffi_string_result(path, |path| {
         let summary = Nd2Summary::open(path)?;
         Ok(summary_json(&summary))
@@ -1060,7 +1060,7 @@ pub extern "C" fn nd2_rs_summary_json(path: *const c_char) -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_index_json(path: *const c_char) -> *mut c_char {
+pub extern "C" fn rsnd2_index_json(path: *const c_char) -> *mut c_char {
     ffi_string_result(path, |path| {
         let index = Nd2Index::open(path)?;
         Ok(index_json(&index))
@@ -1068,7 +1068,7 @@ pub extern "C" fn nd2_rs_index_json(path: *const c_char) -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_read_plane_payload(path: *const c_char, sequence: usize) -> Nd2Buffer {
+pub extern "C" fn rsnd2_read_plane_payload(path: *const c_char, sequence: usize) -> Nd2Buffer {
     let result = ffi_path(path).and_then(|path| {
         let index = Nd2Index::open(&path)?;
         index.read_plane_payload(sequence)
@@ -1118,8 +1118,8 @@ impl Nd2Status {
 
 /// Open a persistent reader handle for batched frame reads. On success
 /// `handle` is a non-null pointer that must be released with
-/// `nd2_rs_reader_free`. On failure `status` is non-zero and `error` carries
-/// an owned message that must be released with `nd2_rs_free_string`.
+/// `rsnd2_reader_free`. On failure `status` is non-zero and `error` carries
+/// an owned message that must be released with `rsnd2_free_string`.
 #[repr(C)]
 pub struct Nd2OpenResult {
     pub handle: *mut c_void,
@@ -1128,7 +1128,7 @@ pub struct Nd2OpenResult {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_reader_open(path: *const c_char) -> Nd2OpenResult {
+pub extern "C" fn rsnd2_reader_open(path: *const c_char) -> Nd2OpenResult {
     match ffi_path(path).and_then(|path| Nd2Reader::open(&path)) {
         Ok(reader) => Nd2OpenResult {
             handle: Box::into_raw(Box::new(reader)) as *mut c_void,
@@ -1144,7 +1144,7 @@ pub extern "C" fn nd2_rs_reader_open(path: *const c_char) -> Nd2OpenResult {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_reader_free(handle: *mut c_void) {
+pub extern "C" fn rsnd2_reader_free(handle: *mut c_void) {
     if !handle.is_null() {
         unsafe {
             drop(Box::from_raw(handle as *mut Nd2Reader));
@@ -1156,7 +1156,7 @@ pub extern "C" fn nd2_rs_reader_free(handle: *mut c_void) {
 /// stamp) contiguously into the caller-owned buffer at `out_ptr`/`out_len`,
 /// using up to `n_threads` concurrent positional reads (0 selects a default).
 #[unsafe(no_mangle)]
-pub extern "C" fn nd2_rs_reader_read_frames(
+pub extern "C" fn rsnd2_reader_read_frames(
     handle: *mut c_void,
     indices: *const u64,
     n_indices: usize,

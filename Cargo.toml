@@ -1,10 +1,10 @@
 [package]
-name = "nd2-rs"
+name = "rsnd2"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "nd2_rs"
+name = "rsnd2"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]

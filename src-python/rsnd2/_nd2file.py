@@ -18,7 +18,7 @@ _PREFIX_LEN = 8
 
 
 class ND2File:
-    """Open and read an ND2 file using the nd2-rs parser.
+    """Open and read an ND2 file using the rsnd2 parser.
 
     This class follows the public shape of the upstream ``nd2.ND2File`` API.
     The current Rust core supports modern chunked ND2 indexing and raw,
@@ -298,7 +298,7 @@ class ND2File:
 
     @property
     def text_info(self) -> TextInfo:
-        return TextInfo(description=f"ND2 parsed by nd2-rs from {self._path.name}")
+        return TextInfo(description=f"ND2 parsed by rsnd2 from {self._path.name}")
 
     @property
     def rois(self) -> dict[int, Any]:
@@ -328,7 +328,7 @@ class ND2File:
         if exclude is not None:
             chunks = {k: v for k, v in chunks.items() if k not in exclude}
         return {
-            "nd2_rs_index": {
+            "rsnd2_index": {
                 "variant": self._ensure_index().get("variant"),
                 "signature_version": self._ensure_index().get("signature_version"),
                 "chunk_name_counts": chunks,
@@ -468,13 +468,13 @@ class ND2File:
         return None
 
     def ome_metadata(self, *, include_unstructured: bool = True, tiff_file_name: str | None = None):
-        raise NotImplementedError("OME metadata generation is not implemented in nd2-rs yet")
+        raise NotImplementedError("OME metadata generation is not implemented in rsnd2 yet")
 
     def write_tiff(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError("TIFF export is not implemented in nd2-rs yet")
+        raise NotImplementedError("TIFF export is not implemented in rsnd2 yet")
 
     def write_ome_zarr(self, *args: Any, **kwargs: Any):
-        raise NotImplementedError("OME-Zarr export is not implemented in nd2-rs yet")
+        raise NotImplementedError("OME-Zarr export is not implemented in rsnd2 yet")
 
     def to_dask(self, wrapper: bool = True, copy: bool = True):
         import dask.array as da
@@ -576,7 +576,7 @@ def _numpy():
     try:
         import numpy as np
     except ImportError as exc:
-        raise ImportError("NumPy is required for array output from nd2-rs") from exc
+        raise ImportError("NumPy is required for array output from rsnd2") from exc
     return np
 
 

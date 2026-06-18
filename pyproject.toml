@@ -3,12 +3,12 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nd2-rs"
+name = "rsnd2"
 version = "0.1.0"
-description = "Python bindings for the nd2-rs reader with an nd2-compatible API"
+description = "Python bindings for the rsnd2 reader with an nd2-compatible API"
 readme = "fast_nd2_reader_implementation_plan.md"
 requires-python = ">=3.10"
-authors = [{ name = "nd2-rs contributors" }]
+authors = [{ name = "rsnd2 contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
@@ -25,4 +25,4 @@ include-package-data = true
 where = ["src-python"]
 
 [tool.setuptools.package-data]
-nd2 = ["libnd2_rs.so", "libnd2_rs.dylib", "nd2_rs.dll", "py.typed"]
+rsnd2 = ["librsnd2.so", "librsnd2.dylib", "rsnd2.dll", "py.typed"]

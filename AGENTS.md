@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Rust ND2 reader core with Python bindings. Rust source lives in `src/`: `src/lib.rs` exposes parser, index, and FFI helpers, while `src/main.rs` provides CLI commands such as `inspect`, `scan`, and `bench-read`. Python package code lives in `src-python/nd2/`; `_ffi.py` loads the native library, `_nd2file.py` provides `ND2File`, and `structures.py` contains API-compatible data classes. Tests are in `tests/`. Packaging metadata is in `Cargo.toml`, `pyproject.toml`, and `setup.py`.
+This repository contains a Rust ND2 reader core with Python bindings. Rust source lives in `src/`: `src/lib.rs` exposes parser, index, and FFI helpers, while `src/main.rs` provides CLI commands such as `inspect`, `scan`, and `bench-read`. Python package code lives in `src-python/rsnd2/` (imported as `rsnd2`, distinct from the PyPI `nd2` package); `_ffi.py` loads the native library, `_nd2file.py` provides `ND2File`, and `structures.py` contains API-compatible data classes. Tests are in `tests/`. Packaging metadata is in `Cargo.toml`, `pyproject.toml`, and `setup.py`.
 
 ## Build, Test, and Development Commands
 
