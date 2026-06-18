@@ -159,15 +159,24 @@ class ND2File:
             t = torch.from_numpy(np.ascontiguousarray(arr))
             return t.to(device, non_blocking=True) if device is not None else t
 
-        if n_threads is None:
-            n_threads = int(os.environ.get("ND2_RS_READ_THREADS", "1"))
-
         n = len(idx_list)
         height = attrs.heightPx
         width = attrs.widthPx
         comp = attrs.componentCount
         pixel_len = height * attrs.widthBytes
         total = n * pixel_len
+
+        if n_threads is None:
+            env = os.environ.get("ND2_RS_READ_THREADS")
+            if env is not None:
+                n_threads = int(env)
+            else:
+                # Adaptive: tiny batches are dominated by thread-spawn overhead,
+                # so read them on one thread; larger batches benefit from many
+                # concurrent positional reads (breaking the single-stream NFS
+                # ceiling) and parallel host page-faults. ~2 MB per reader,
+                # capped so we never oversubscribe.
+                n_threads = 1 if total < (8 << 20) else min(16, max(1, total // (2 << 20)))
 
         idx = np.asarray(idx_list, dtype=np.uint64)
         host = np.empty(total, dtype=np.uint8)
