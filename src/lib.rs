@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -326,6 +326,135 @@ impl Nd2Index {
             total += pixel_len;
         }
         Ok(total)
+    }
+}
+
+/// A persistent reader over a single ND2 file: the parsed plane index plus an
+/// open file handle, so repeated batched reads avoid re-parsing the chunk map
+/// and re-opening the file on every call. Positional reads (`pread`) are used
+/// throughout, so a single handle is safe to share across threads.
+pub struct Nd2Reader {
+    index: Nd2Index,
+    file: File,
+}
+
+impl Nd2Reader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let index = Nd2Index::open(path)?;
+        let file = File::open(path)?;
+        Ok(Self { index, file })
+    }
+
+    pub fn index(&self) -> &Nd2Index {
+        &self.index
+    }
+
+    fn plane_for(&self, sequence: usize) -> Result<&PlaneRecord> {
+        let planes = &self.index.planes;
+        if sequence < planes.len() && planes[sequence].sequence == sequence {
+            return Ok(&planes[sequence]);
+        }
+        planes
+            .iter()
+            .find(|plane| plane.sequence == sequence)
+            .ok_or_else(|| Nd2Error::Invalid(format!("frame index {sequence} is not indexed")))
+    }
+
+    /// Pack the pixel bytes (each plane's payload minus the leading `prefix_len`
+    /// stamp) for the requested plane sequences contiguously into `out`, in the
+    /// order given by `indices`. Reads are issued positionally so up to
+    /// `n_threads` planes can be fetched concurrently — important for breaking
+    /// the single-stream throughput ceiling on networked (NFS) storage.
+    pub fn read_frames_into(
+        &self,
+        indices: &[u64],
+        prefix_len: u64,
+        out: &mut [u8],
+        n_threads: usize,
+    ) -> Result<()> {
+        // Resolve each requested sequence to a (source offset, length) job and
+        // validate that the destination buffer is exactly the right size.
+        let mut jobs: Vec<(u64, usize)> = Vec::with_capacity(indices.len());
+        let mut total = 0usize;
+        for &seq in indices {
+            let plane = self.plane_for(seq as usize)?;
+            let pixel_len = plane.payload_len.checked_sub(prefix_len).ok_or_else(|| {
+                Nd2Error::Invalid(format!(
+                    "plane {} payload is shorter than {prefix_len} bytes",
+                    plane.sequence
+                ))
+            })? as usize;
+            jobs.push((plane.payload_offset + prefix_len, pixel_len));
+            total = total
+                .checked_add(pixel_len)
+                .ok_or_else(|| Nd2Error::Invalid("batch pixel length overflow".to_string()))?;
+        }
+        if total != out.len() {
+            return Err(Nd2Error::Invalid(format!(
+                "output buffer is {} bytes but {} frames need {total} bytes",
+                out.len(),
+                indices.len()
+            )));
+        }
+
+        let threads = n_threads.clamp(1, jobs.len().max(1));
+        if threads <= 1 {
+            let mut dst = 0usize;
+            for (src, len) in &jobs {
+                read_exact_at(&self.file, &mut out[dst..dst + len], *src)?;
+                dst += len;
+            }
+            return Ok(());
+        }
+
+        // Partition the jobs into `threads` contiguous groups; because jobs are
+        // emitted in destination order, each group owns one contiguous slice of
+        // `out`, carved out with split_at_mut so the borrows stay disjoint.
+        let per = jobs.len().div_ceil(threads);
+        let file = &self.file;
+        let mut group_slices: Vec<(&mut [u8], &[(u64, usize)])> = Vec::new();
+        let mut remaining: &mut [u8] = out;
+        let mut start = 0usize;
+        while start < jobs.len() {
+            let end = (start + per).min(jobs.len());
+            let group = &jobs[start..end];
+            let bytes: usize = group.iter().map(|(_, len)| *len).sum();
+            let (head, tail) = remaining.split_at_mut(bytes);
+            group_slices.push((head, group));
+            remaining = tail;
+            start = end;
+        }
+
+        let mut first_err: Option<Nd2Error> = None;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = group_slices
+                .into_iter()
+                .map(|(slice, group)| {
+                    scope.spawn(move || -> Result<()> {
+                        let mut dst = 0usize;
+                        for (src, len) in group {
+                            read_exact_at(file, &mut slice[dst..dst + len], *src)?;
+                            dst += len;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Err(err)) if first_err.is_none() => first_err = Some(err),
+                    Err(_) if first_err.is_none() => {
+                        first_err = Some(Nd2Error::Invalid("reader thread panicked".to_string()))
+                    }
+                    _ => {}
+                }
+            }
+        });
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 
@@ -962,6 +1091,96 @@ pub extern "C" fn nd2_rs_read_plane_payload(path: *const c_char, sequence: usize
             status: 1,
             error: c_string(format!("{err}")),
         },
+    }
+}
+
+#[repr(C)]
+pub struct Nd2Status {
+    pub status: c_int,
+    pub error: *mut c_char,
+}
+
+impl Nd2Status {
+    fn ok() -> Self {
+        Nd2Status {
+            status: 0,
+            error: std::ptr::null_mut(),
+        }
+    }
+
+    fn err(message: impl Into<String>) -> Self {
+        Nd2Status {
+            status: 1,
+            error: c_string(message.into()),
+        }
+    }
+}
+
+/// Open a persistent reader handle for batched frame reads. On success
+/// `handle` is a non-null pointer that must be released with
+/// `nd2_rs_reader_free`. On failure `status` is non-zero and `error` carries
+/// an owned message that must be released with `nd2_rs_free_string`.
+#[repr(C)]
+pub struct Nd2OpenResult {
+    pub handle: *mut c_void,
+    pub status: c_int,
+    pub error: *mut c_char,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nd2_rs_reader_open(path: *const c_char) -> Nd2OpenResult {
+    match ffi_path(path).and_then(|path| Nd2Reader::open(&path)) {
+        Ok(reader) => Nd2OpenResult {
+            handle: Box::into_raw(Box::new(reader)) as *mut c_void,
+            status: 0,
+            error: std::ptr::null_mut(),
+        },
+        Err(err) => Nd2OpenResult {
+            handle: std::ptr::null_mut(),
+            status: 1,
+            error: c_string(format!("{err}")),
+        },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nd2_rs_reader_free(handle: *mut c_void) {
+    if !handle.is_null() {
+        unsafe {
+            drop(Box::from_raw(handle as *mut Nd2Reader));
+        }
+    }
+}
+
+/// Pack the pixel bytes for `n_indices` planes (each minus a `prefix_len`-byte
+/// stamp) contiguously into the caller-owned buffer at `out_ptr`/`out_len`,
+/// using up to `n_threads` concurrent positional reads (0 selects a default).
+#[unsafe(no_mangle)]
+pub extern "C" fn nd2_rs_reader_read_frames(
+    handle: *mut c_void,
+    indices: *const u64,
+    n_indices: usize,
+    prefix_len: u64,
+    out_ptr: *mut u8,
+    out_len: usize,
+    n_threads: usize,
+) -> Nd2Status {
+    if handle.is_null() {
+        return Nd2Status::err("reader handle is null");
+    }
+    if out_ptr.is_null() && out_len > 0 {
+        return Nd2Status::err("output buffer pointer is null");
+    }
+    if indices.is_null() && n_indices > 0 {
+        return Nd2Status::err("indices pointer is null");
+    }
+    let reader = unsafe { &*(handle as *const Nd2Reader) };
+    let idx = unsafe { std::slice::from_raw_parts(indices, n_indices) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
+    let threads = if n_threads == 0 { 1 } else { n_threads };
+    match reader.read_frames_into(idx, prefix_len, out, threads) {
+        Ok(()) => Nd2Status::ok(),
+        Err(err) => Nd2Status::err(format!("{err}")),
     }
 }
 
