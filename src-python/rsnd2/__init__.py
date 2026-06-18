@@ -1,4 +1,4 @@
-"""nd2-compatible Python API backed by the nd2-rs parser."""
+"""nd2-compatible Python API backed by the rsnd2 parser."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from ._nd2file import ND2File, imread
 from ._util import AXIS, is_legacy, is_supported_file, rescue_nd2
 
 try:
-    __version__ = version("nd2-rs") if version else "unknown"
+    __version__ = version("rsnd2") if version else "unknown"
 except PackageNotFoundError:  # pragma: no cover
     __version__ = "unknown"
 

@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use nd2_rs::{Nd2Index, Nd2Summary, Nd2VersionProbe, discover_nd2_files, fnv1a64};
+use rsnd2::{Nd2Index, Nd2Summary, Nd2VersionProbe, discover_nd2_files, fnv1a64};
 
 fn main() {
     if let Err(err) = run() {
@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match command.as_str() {
         "inspect" => {
             if paths.is_empty() {
-                return Err("usage: nd2-rs inspect FILE.nd2 [FILE.nd2 ...]".into());
+                return Err("usage: rsnd2 inspect FILE.nd2 [FILE.nd2 ...]".into());
             }
             for path in paths {
                 inspect_one(&path);
@@ -32,19 +32,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "scan" => {
             if paths.is_empty() {
-                return Err("usage: nd2-rs scan ROOT [ROOT ...]".into());
+                return Err("usage: rsnd2 scan ROOT [ROOT ...]".into());
             }
             scan_roots(&paths)?;
         }
         "versions" => {
             if paths.is_empty() {
-                return Err("usage: nd2-rs versions ROOT [ROOT ...]".into());
+                return Err("usage: rsnd2 versions ROOT [ROOT ...]".into());
             }
             scan_versions(&paths)?;
         }
         "bench-read" => {
             if paths.is_empty() {
-                return Err("usage: nd2-rs bench-read FILE.nd2 [FILE.nd2 ...]".into());
+                return Err("usage: rsnd2 bench-read FILE.nd2 [FILE.nd2 ...]".into());
             }
             for path in paths {
                 bench_read_one(&path);
@@ -52,17 +52,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "dump-pixels" => {
             if paths.len() != 1 {
-                return Err("usage: nd2-rs dump-pixels FILE.nd2 > pixels.bin".into());
+                return Err("usage: rsnd2 dump-pixels FILE.nd2 > pixels.bin".into());
             }
             dump_pixels(&paths[0])?;
         }
         _ => {
             eprintln!("usage:");
-            eprintln!("  nd2-rs inspect FILE.nd2 [FILE.nd2 ...]");
-            eprintln!("  nd2-rs scan ROOT [ROOT ...]");
-            eprintln!("  nd2-rs versions ROOT [ROOT ...]");
-            eprintln!("  nd2-rs bench-read FILE.nd2 [FILE.nd2 ...]");
-            eprintln!("  nd2-rs dump-pixels FILE.nd2 > pixels.bin");
+            eprintln!("  rsnd2 inspect FILE.nd2 [FILE.nd2 ...]");
+            eprintln!("  rsnd2 scan ROOT [ROOT ...]");
+            eprintln!("  rsnd2 versions ROOT [ROOT ...]");
+            eprintln!("  rsnd2 bench-read FILE.nd2 [FILE.nd2 ...]");
+            eprintln!("  rsnd2 dump-pixels FILE.nd2 > pixels.bin");
         }
     }
 

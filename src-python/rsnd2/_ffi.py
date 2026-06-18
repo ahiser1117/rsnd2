@@ -34,10 +34,10 @@ class _OpenResult(ctypes.Structure):
 
 def _library_names() -> list[str]:
     if sys.platform == "win32":
-        return ["nd2_rs.dll"]
+        return ["rsnd2.dll"]
     if sys.platform == "darwin":
-        return ["libnd2_rs.dylib"]
-    return ["libnd2_rs.so"]
+        return ["librsnd2.dylib"]
+    return ["librsnd2.so"]
 
 
 def _candidate_paths() -> list[Path]:
@@ -53,7 +53,7 @@ def _candidate_paths() -> list[Path]:
         repo_root / "target" / "debug",
     ):
         candidates.extend(base / name for name in _library_names())
-    if env_path := os.environ.get("ND2_RS_LIBRARY"):
+    if env_path := os.environ.get("RSND2_LIBRARY"):
         candidates.insert(0, Path(env_path))
     return candidates
 
@@ -68,21 +68,21 @@ def _load() -> ctypes.CDLL:
         except OSError as exc:
             errors.append(f"{path}: {exc}")
             continue
-        lib.nd2_rs_free_string.argtypes = [ctypes.c_void_p]
-        lib.nd2_rs_free_string.restype = None
-        lib.nd2_rs_free_buffer.argtypes = [_Buffer]
-        lib.nd2_rs_free_buffer.restype = None
-        for name in ("nd2_rs_version_probe_json", "nd2_rs_summary_json", "nd2_rs_index_json"):
+        lib.rsnd2_free_string.argtypes = [ctypes.c_void_p]
+        lib.rsnd2_free_string.restype = None
+        lib.rsnd2_free_buffer.argtypes = [_Buffer]
+        lib.rsnd2_free_buffer.restype = None
+        for name in ("rsnd2_version_probe_json", "rsnd2_summary_json", "rsnd2_index_json"):
             fn = getattr(lib, name)
             fn.argtypes = [ctypes.c_char_p]
             fn.restype = ctypes.c_void_p
-        lib.nd2_rs_read_plane_payload.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
-        lib.nd2_rs_read_plane_payload.restype = _Buffer
-        lib.nd2_rs_reader_open.argtypes = [ctypes.c_char_p]
-        lib.nd2_rs_reader_open.restype = _OpenResult
-        lib.nd2_rs_reader_free.argtypes = [ctypes.c_void_p]
-        lib.nd2_rs_reader_free.restype = None
-        lib.nd2_rs_reader_read_frames.argtypes = [
+        lib.rsnd2_read_plane_payload.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        lib.rsnd2_read_plane_payload.restype = _Buffer
+        lib.rsnd2_reader_open.argtypes = [ctypes.c_char_p]
+        lib.rsnd2_reader_open.restype = _OpenResult
+        lib.rsnd2_reader_free.argtypes = [ctypes.c_void_p]
+        lib.rsnd2_reader_free.restype = None
+        lib.rsnd2_reader_read_frames.argtypes = [
             ctypes.c_void_p,            # handle
             ctypes.c_void_p,            # indices (*const u64)
             ctypes.c_size_t,            # n_indices
@@ -91,11 +91,11 @@ def _load() -> ctypes.CDLL:
             ctypes.c_size_t,            # out_len
             ctypes.c_size_t,            # n_threads
         ]
-        lib.nd2_rs_reader_read_frames.restype = _Status
+        lib.rsnd2_reader_read_frames.restype = _Status
         return lib
     detail = "; ".join(errors) if errors else "no compiled library was found"
     raise ImportError(
-        "Could not load nd2-rs shared library. Run `cargo build --lib` from the "
+        "Could not load rsnd2 shared library. Run `cargo build --lib` from the "
         f"repository root or install the package with a build backend. Detail: {detail}"
     )
 
@@ -122,7 +122,7 @@ def _json_call(name: str, path: str | os.PathLike[str]) -> dict[str, Any]:
     try:
         raw = ctypes.string_at(ptr).decode("utf-8")
     finally:
-        lib().nd2_rs_free_string(ptr)
+        lib().rsnd2_free_string(ptr)
     data = json.loads(raw)
     if "error" in data:
         raise ValueError(data["error"])
@@ -130,26 +130,26 @@ def _json_call(name: str, path: str | os.PathLike[str]) -> dict[str, Any]:
 
 
 def version_probe(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _json_call("nd2_rs_version_probe_json", path)
+    return _json_call("rsnd2_version_probe_json", path)
 
 
 def summary(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _json_call("nd2_rs_summary_json", path)
+    return _json_call("rsnd2_summary_json", path)
 
 
 def index(path: str | os.PathLike[str]) -> dict[str, Any]:
-    return _json_call("nd2_rs_index_json", path)
+    return _json_call("rsnd2_index_json", path)
 
 
 def read_plane_payload(path: str | os.PathLike[str], sequence: int) -> bytes:
-    buffer = lib().nd2_rs_read_plane_payload(_path_bytes(path), sequence)
+    buffer = lib().rsnd2_read_plane_payload(_path_bytes(path), sequence)
     try:
         if buffer.status:
             error = ctypes.string_at(buffer.error).decode("utf-8") if buffer.error else "read failed"
             raise ValueError(error)
         return ctypes.string_at(buffer.ptr, buffer.len)
     finally:
-        lib().nd2_rs_free_buffer(buffer)
+        lib().rsnd2_free_buffer(buffer)
 
 
 def _take_error(ptr: int | None, default: str) -> str:
@@ -160,12 +160,12 @@ def _take_error(ptr: int | None, default: str) -> str:
     try:
         return ctypes.string_at(ptr).decode("utf-8", "replace")
     finally:
-        lib().nd2_rs_free_string(ptr)
+        lib().rsnd2_free_string(ptr)
 
 
 def _raise_status(status: _Status) -> None:
     if status.status:
-        raise ValueError(_take_error(status.error, "nd2-rs call failed"))
+        raise ValueError(_take_error(status.error, "rsnd2 call failed"))
 
 
 class Reader:
@@ -176,7 +176,7 @@ class Reader:
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
-        result = lib().nd2_rs_reader_open(_path_bytes(path))
+        result = lib().rsnd2_reader_open(_path_bytes(path))
         if result.status or not result.handle:
             raise ValueError(_take_error(result.error, "open failed"))
         self._handle: int | None = result.handle
@@ -195,7 +195,7 @@ class Reader:
         array of ``n_indices`` little-endian ``uint64`` plane sequence numbers."""
         if self._handle is None:
             raise ValueError("reader is closed")
-        status = lib().nd2_rs_reader_read_frames(
+        status = lib().rsnd2_reader_read_frames(
             self._handle,
             ctypes.c_void_p(indices_ptr),
             n_indices,
@@ -211,7 +211,7 @@ class Reader:
         # free the same pointer twice.
         handle, self._handle = self._handle, None
         if handle is not None:
-            lib().nd2_rs_reader_free(handle)
+            lib().rsnd2_reader_free(handle)
 
     def __del__(self) -> None:
         try:

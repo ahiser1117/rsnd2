@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "nd2-rs"
+name = "rsnd2"
 version = "0.1.0"

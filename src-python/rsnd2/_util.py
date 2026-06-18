@@ -48,4 +48,4 @@ def is_legacy(path: str | PathLike[str]) -> bool:
 
 
 def rescue_nd2(*args: Any, **kwargs: Any) -> None:
-    raise NotImplementedError("Corrupt-frame rescue is not implemented in nd2-rs yet")
+    raise NotImplementedError("Corrupt-frame rescue is not implemented in rsnd2 yet")

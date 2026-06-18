@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src-python"))
 
-import nd2  # noqa: E402
-from nd2 import _ffi  # noqa: E402
+import rsnd2 as nd2  # noqa: E402
+from rsnd2 import _ffi  # noqa: E402
 
 
 MAGIC = bytes([0xDA, 0xCE, 0xBE, 0x0A])
