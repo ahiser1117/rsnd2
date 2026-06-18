@@ -152,11 +152,20 @@ def read_plane_payload(path: str | os.PathLike[str], sequence: int) -> bytes:
         lib().nd2_rs_free_buffer(buffer)
 
 
+def _take_error(ptr: int | None, default: str) -> str:
+    """Decode and free an owned error string from the Rust side exactly once,
+    even if decoding fails."""
+    if not ptr:
+        return default
+    try:
+        return ctypes.string_at(ptr).decode("utf-8", "replace")
+    finally:
+        lib().nd2_rs_free_string(ptr)
+
+
 def _raise_status(status: _Status) -> None:
     if status.status:
-        msg = ctypes.string_at(status.error).decode("utf-8") if status.error else "nd2-rs call failed"
-        lib().nd2_rs_free_string(status.error)
-        raise ValueError(msg)
+        raise ValueError(_take_error(status.error, "nd2-rs call failed"))
 
 
 class Reader:
@@ -169,9 +178,7 @@ class Reader:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         result = lib().nd2_rs_reader_open(_path_bytes(path))
         if result.status or not result.handle:
-            msg = ctypes.string_at(result.error).decode("utf-8") if result.error else "open failed"
-            lib().nd2_rs_free_string(result.error)
-            raise ValueError(msg)
+            raise ValueError(_take_error(result.error, "open failed"))
         self._handle: int | None = result.handle
 
     def read_frames_into(
@@ -200,9 +207,11 @@ class Reader:
         _raise_status(status)
 
     def close(self) -> None:
-        if self._handle is not None:
-            lib().nd2_rs_reader_free(self._handle)
-            self._handle = None
+        # Clear the handle first so a failure (or re-entry via __del__) can never
+        # free the same pointer twice.
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            lib().nd2_rs_reader_free(handle)
 
     def __del__(self) -> None:
         try:

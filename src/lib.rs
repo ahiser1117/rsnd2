@@ -1175,8 +1175,18 @@ pub extern "C" fn nd2_rs_reader_read_frames(
         return Nd2Status::err("indices pointer is null");
     }
     let reader = unsafe { &*(handle as *const Nd2Reader) };
-    let idx = unsafe { std::slice::from_raw_parts(indices, n_indices) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
+    // `slice::from_raw_parts` requires a non-null, aligned pointer even for a
+    // zero length, so synthesize empty slices when nothing was requested.
+    let idx = if n_indices == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(indices, n_indices) }
+    };
+    let out = if out_len == 0 {
+        &mut [][..]
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) }
+    };
     let threads = if n_threads == 0 { 1 } else { n_threads };
     match reader.read_frames_into(idx, prefix_len, out, threads) {
         Ok(()) => Nd2Status::ok(),
