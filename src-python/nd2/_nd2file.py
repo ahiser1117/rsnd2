@@ -46,6 +46,7 @@ class ND2File:
         self._file = None
         self._mmap = None
         self._reader = None
+        self._pin_u8 = None
 
     @staticmethod
     def is_supported_file(path: str | PathLike[str]) -> bool:
@@ -65,6 +66,7 @@ class ND2File:
 
     def close(self) -> None:
         self._closed = True
+        self._pin_u8 = None
         if self._reader is not None:
             self._reader.close()
             self._reader = None
@@ -176,21 +178,48 @@ class ND2File:
                 # concurrent positional reads (breaking the single-stream NFS
                 # ceiling) and parallel host page-faults. ~2 MB per reader,
                 # capped so we never oversubscribe.
-                n_threads = 1 if total < (8 << 20) else min(16, max(1, total // (2 << 20)))
+                n_threads = 1 if total < (8 << 20) else min(16, max(1, total // (1 << 20)))
+        n_threads = max(1, int(n_threads))
 
         idx = np.asarray(idx_list, dtype=np.uint64)
-        host = np.empty(total, dtype=np.uint8)
         reader = self._ensure_reader()
-        reader.read_frames_into(
-            idx.ctypes.data, n, _PREFIX_LEN, host.ctypes.data, total, max(1, int(n_threads))
-        )
 
-        arr = host.view(self.dtype).reshape(n, height, width, comp)
-        t = torch.from_numpy(arr)
+        torch_dtype = {
+            "uint8": torch.uint8,
+            "uint16": torch.uint16,
+            "int16": torch.int16,
+            "float32": torch.float32,
+        }.get(np.dtype(self.dtype).name)
+
+        if torch_dtype is None:
+            # Uncommon dtype: fall back to a plain host buffer.
+            host = np.empty(total, dtype=np.uint8)
+            reader.read_frames_into(idx.ctypes.data, n, _PREFIX_LEN, host.ctypes.data, total, n_threads)
+            arr = host.view(self.dtype).reshape(n, height, width, comp)
+            t = torch.from_numpy(arr)
+            if device is not None:
+                t = t.to(device, non_blocking=True)
+            return t.permute(0, 3, 1, 2).contiguous()
+
+        # Reusable pinned staging buffer: page-locked host memory makes the
+        # host->device copy a single direct DMA (roughly 2x pageable) and, being
+        # reused across calls, removes the per-call allocation + first-touch page
+        # faults (which otherwise spike sharply for batches above glibc's ~32 MB
+        # mmap threshold).
+        pin = self._pin_u8
+        if pin is None or pin.numel() < total:
+            pin = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+            self._pin_u8 = pin
+        reader.read_frames_into(idx.ctypes.data, n, _PREFIX_LEN, pin.data_ptr(), total, n_threads)
+
+        staging = pin[:total].view(torch_dtype).reshape(n, height, width, comp)
         if device is not None:
-            t = t.to(device, non_blocking=True)
-        # (N, Y, X, C) -> (N, C, Y, X), undone on-device where it is cheap.
-        return t.permute(0, 3, 1, 2).contiguous()
+            # Blocking copy: the pinned buffer is overwritten on the next call.
+            dst = staging.to(device, non_blocking=False)
+        else:
+            dst = staging.clone()
+        # (N, Y, X, C) -> (N, C, Y, X), undone on the destination device.
+        return dst.permute(0, 3, 1, 2).contiguous()
 
     @property
     def index(self) -> Mapping[str, Any]:
