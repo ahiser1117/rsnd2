@@ -17,6 +17,21 @@ class _Buffer(ctypes.Structure):
     ]
 
 
+class _Status(ctypes.Structure):
+    _fields_ = [
+        ("status", ctypes.c_int),
+        ("error", ctypes.c_void_p),
+    ]
+
+
+class _OpenResult(ctypes.Structure):
+    _fields_ = [
+        ("handle", ctypes.c_void_p),
+        ("status", ctypes.c_int),
+        ("error", ctypes.c_void_p),
+    ]
+
+
 def _library_names() -> list[str]:
     if sys.platform == "win32":
         return ["nd2_rs.dll"]
@@ -63,6 +78,20 @@ def _load() -> ctypes.CDLL:
             fn.restype = ctypes.c_void_p
         lib.nd2_rs_read_plane_payload.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         lib.nd2_rs_read_plane_payload.restype = _Buffer
+        lib.nd2_rs_reader_open.argtypes = [ctypes.c_char_p]
+        lib.nd2_rs_reader_open.restype = _OpenResult
+        lib.nd2_rs_reader_free.argtypes = [ctypes.c_void_p]
+        lib.nd2_rs_reader_free.restype = None
+        lib.nd2_rs_reader_read_frames.argtypes = [
+            ctypes.c_void_p,            # handle
+            ctypes.c_void_p,            # indices (*const u64)
+            ctypes.c_size_t,            # n_indices
+            ctypes.c_uint64,            # prefix_len
+            ctypes.c_void_p,            # out_ptr
+            ctypes.c_size_t,            # out_len
+            ctypes.c_size_t,            # n_threads
+        ]
+        lib.nd2_rs_reader_read_frames.restype = _Status
         return lib
     detail = "; ".join(errors) if errors else "no compiled library was found"
     raise ImportError(
@@ -121,3 +150,71 @@ def read_plane_payload(path: str | os.PathLike[str], sequence: int) -> bytes:
         return ctypes.string_at(buffer.ptr, buffer.len)
     finally:
         lib().nd2_rs_free_buffer(buffer)
+
+
+def _take_error(ptr: int | None, default: str) -> str:
+    """Decode and free an owned error string from the Rust side exactly once,
+    even if decoding fails."""
+    if not ptr:
+        return default
+    try:
+        return ctypes.string_at(ptr).decode("utf-8", "replace")
+    finally:
+        lib().nd2_rs_free_string(ptr)
+
+
+def _raise_status(status: _Status) -> None:
+    if status.status:
+        raise ValueError(_take_error(status.error, "nd2-rs call failed"))
+
+
+class Reader:
+    """Persistent handle for fast batched frame reads from one ND2 file.
+
+    Wraps the Rust ``Nd2Reader`` (parsed index + open file descriptor) so that
+    repeated batch reads avoid re-parsing the chunk map and re-opening the file.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        result = lib().nd2_rs_reader_open(_path_bytes(path))
+        if result.status or not result.handle:
+            raise ValueError(_take_error(result.error, "open failed"))
+        self._handle: int | None = result.handle
+
+    def read_frames_into(
+        self,
+        indices_ptr: int,
+        n_indices: int,
+        prefix_len: int,
+        out_ptr: int,
+        out_len: int,
+        n_threads: int,
+    ) -> None:
+        """Fill the caller-owned buffer at ``out_ptr`` (``out_len`` bytes) with the
+        packed pixel bytes of the requested planes. ``indices_ptr`` points at an
+        array of ``n_indices`` little-endian ``uint64`` plane sequence numbers."""
+        if self._handle is None:
+            raise ValueError("reader is closed")
+        status = lib().nd2_rs_reader_read_frames(
+            self._handle,
+            ctypes.c_void_p(indices_ptr),
+            n_indices,
+            prefix_len,
+            ctypes.c_void_p(out_ptr),
+            out_len,
+            n_threads,
+        )
+        _raise_status(status)
+
+    def close(self) -> None:
+        # Clear the handle first so a failure (or re-entry via __del__) can never
+        # free the same pointer twice.
+        handle, self._handle = self._handle, None
+        if handle is not None:
+            lib().nd2_rs_reader_free(handle)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass

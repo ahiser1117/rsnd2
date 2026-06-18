@@ -45,6 +45,8 @@ class ND2File:
         self._version_probe: dict[str, Any] | None = None
         self._file = None
         self._mmap = None
+        self._reader = None
+        self._pin_u8 = None
 
     @staticmethod
     def is_supported_file(path: str | PathLike[str]) -> bool:
@@ -64,6 +66,10 @@ class ND2File:
 
     def close(self) -> None:
         self._closed = True
+        self._pin_u8 = None
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
         if self._mmap is not None:
             try:
                 self._mmap.close()
@@ -113,6 +119,119 @@ class ND2File:
             self._file = open(self._path, "rb")
             self._mmap = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
         return self._mmap
+
+    def _ensure_reader(self):
+        self._ensure_open()
+        if self._reader is None:
+            self._reader = _ffi.Reader(self._path)
+        return self._reader
+
+    def read_batch_to_torch(self, indices, *, device=None, n_threads: int | None = None):
+        """Stream a batch of frames straight into a contiguous ``torch`` tensor
+        of shape ``(len(indices), C, Y, X)``.
+
+        A single Rust call packs every requested plane's pixel bytes into one
+        contiguous host buffer (optionally using several concurrent positional
+        reads), the buffer is copied to ``device`` in one transfer, and the
+        per-pixel component interleave is undone on the destination device. This
+        avoids the per-frame Python overhead and the strided host gather that a
+        ``np.stack`` of individual frames incurs.
+        """
+        import os
+
+        import torch
+
+        np = _numpy()
+        self._ensure_open()
+        attrs = self.attributes
+        idx_list = [int(i) for i in indices]
+
+        # The fast packed path needs raw, uncompressed, unpadded rows so the
+        # contiguous bytes reshape cleanly into (N, Y, X, components).
+        itemsize = attrs.bitsPerComponentInMemory // 8
+        packed_width_bytes = attrs.widthPx * attrs.componentCount * itemsize
+        fast = (
+            attrs.compressionType is None
+            and attrs.widthBytes == packed_width_bytes
+            and attrs.heightPx > 0
+            and attrs.widthPx > 0
+        )
+        if not fast:
+            arr = np.stack([np.asarray(self.read_frame(i)) for i in idx_list])
+            t = torch.from_numpy(np.ascontiguousarray(arr))
+            return t.to(device, non_blocking=True) if device is not None else t
+
+        n = len(idx_list)
+        height = attrs.heightPx
+        width = attrs.widthPx
+        channel_count = attrs.channelCount or 1
+        comps_per_channel = self.components_per_channel
+        pixel_len = height * attrs.widthBytes
+        total = n * pixel_len
+
+        if n_threads is None:
+            env = os.environ.get("ND2_RS_READ_THREADS")
+            if env is not None:
+                n_threads = int(env)
+            else:
+                # Adaptive: tiny batches are dominated by thread-spawn overhead,
+                # so read them on one thread; larger batches benefit from many
+                # concurrent positional reads (breaking the single-stream NFS
+                # ceiling) and parallel host page-faults. ~1 MB per reader,
+                # capped so we never oversubscribe.
+                n_threads = 1 if total < (8 << 20) else min(16, max(1, total // (1 << 20)))
+        n_threads = max(1, int(n_threads))
+
+        idx = np.asarray(idx_list, dtype=np.uint64)
+        reader = self._ensure_reader()
+
+        torch_dtype = {
+            "uint8": torch.uint8,
+            "uint16": torch.uint16,
+            "int16": torch.int16,
+            "float32": torch.float32,
+        }.get(np.dtype(self.dtype).name)
+
+        def finalize(flat):
+            """Reshape a 1-D device tensor of packed pixels into the same layout
+            ``np.stack([read_frame(i) for i in indices])`` would produce: the raw
+            (Y, X, channel, component) order is permuted to put channel first and
+            then the per-frame singleton axes are squeezed, exactly mirroring
+            ``read_frame``'s ``transpose((2, 0, 1, 3)).squeeze()``."""
+            t = flat.reshape(n, height, width, channel_count, comps_per_channel)
+            t = t.permute(0, 3, 1, 2, 4)  # (N, channel, Y, X, component)
+            for ax in range(t.ndim - 1, 0, -1):  # squeeze non-batch singleton axes
+                if t.shape[ax] == 1:
+                    t = t.squeeze(ax)
+            return t.contiguous()
+
+        if torch_dtype is None:
+            # Uncommon dtype: fall back to a plain host buffer.
+            host = np.empty(total, dtype=np.uint8)
+            reader.read_frames_into(idx.ctypes.data, n, _PREFIX_LEN, host.ctypes.data, total, n_threads)
+            t = torch.from_numpy(host.view(self.dtype))
+            if device is not None:
+                t = t.to(device, non_blocking=False)
+            return finalize(t)
+
+        # Reusable pinned staging buffer: page-locked host memory makes the
+        # host->device copy a single direct DMA (roughly 2x pageable) and, being
+        # reused across calls, removes the per-call allocation + first-touch page
+        # faults (which otherwise spike sharply for batches above glibc's ~32 MB
+        # mmap threshold).
+        pin = self._pin_u8
+        if pin is None or pin.numel() < total:
+            pin = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+            self._pin_u8 = pin
+        reader.read_frames_into(idx.ctypes.data, n, _PREFIX_LEN, pin.data_ptr(), total, n_threads)
+
+        staging = pin[:total].view(torch_dtype)
+        if device is not None:
+            # Blocking copy: the pinned buffer is overwritten on the next call.
+            dst = staging.to(device, non_blocking=False)
+        else:
+            dst = staging.clone()
+        return finalize(dst)
 
     @property
     def index(self) -> Mapping[str, Any]:
