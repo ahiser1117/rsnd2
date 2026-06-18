@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nd2-rs"
+version = "0.1.0"
+description = "Python bindings for the nd2-rs reader with an nd2-compatible API"
+readme = "fast_nd2_reader_implementation_plan.md"
+requires-python = ">=3.10"
+authors = [{ name = "nd2-rs contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+array = ["numpy"]
+dask = ["dask[array]", "resource-backed-dask-array"]
+xarray = ["xarray", "dask[array]"]
+tiff = ["tifffile", "ome-types"]
+
+[tool.setuptools]
+package-dir = {"" = "src-python"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src-python"]
+
+[tool.setuptools.package-data]
+nd2 = ["libnd2_rs.so", "libnd2_rs.dylib", "nd2_rs.dll", "py.typed"]

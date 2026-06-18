@@ -1,0 +1,7 @@
+.venv/
+outputs/
+.matplotlib/
+.jupyter/
+.ipython/
+.ipynb_checkpoints/
+__pycache__/

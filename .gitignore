@@ -1,1 +1,8 @@
 /target
+/build
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.so
+*.dylib
+*.dll
