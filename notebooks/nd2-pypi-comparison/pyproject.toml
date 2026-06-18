@@ -1,0 +1,17 @@
+[project]
+name = "nd2-pypi-comparison"
+version = "0.1.0"
+description = "Notebook comparison of nd2-rs and the PyPI nd2 package"
+requires-python = ">=3.10"
+dependencies = [
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+    "matplotlib>=3.8",
+    "nd2>=0.10",
+    "numpy>=1.26",
+    "pandas>=2.2",
+]
+
+[tool.uv]
+package = false
+
