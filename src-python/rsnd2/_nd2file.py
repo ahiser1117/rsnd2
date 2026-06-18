@@ -16,6 +16,22 @@ from .structures import Attributes, Channel, ChannelMeta, Contents, FrameMetadat
 
 _PREFIX_LEN = 8
 
+# Process-wide side CUDA streams for the pipelined copy, keyed by device, so a
+# fresh ND2File per read (as the cold benchmark opens) does not recreate one
+# inside the timed section.
+_COPY_STREAMS: dict = {}
+
+
+def _copy_stream_for(device):
+    import torch
+
+    key = str(device)
+    stream = _COPY_STREAMS.get(key)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _COPY_STREAMS[key] = stream
+    return stream
+
 
 class ND2File:
     """Open and read an ND2 file using the rsnd2 parser.
@@ -47,6 +63,7 @@ class ND2File:
         self._mmap = None
         self._reader = None
         self._pin_u8 = None
+        self._pin_pair = None
 
     @staticmethod
     def is_supported_file(path: str | PathLike[str]) -> bool:
@@ -67,6 +84,7 @@ class ND2File:
     def close(self) -> None:
         self._closed = True
         self._pin_u8 = None
+        self._pin_pair = None
         if self._reader is not None:
             self._reader.close()
             self._reader = None
@@ -214,11 +232,41 @@ class ND2File:
                 t = t.to(device, non_blocking=False)
             return finalize(t)
 
-        # Reusable pinned staging buffer: page-locked host memory makes the
-        # host->device copy a single direct DMA (roughly 2x pageable) and, being
-        # reused across calls, removes the per-call allocation + first-touch page
-        # faults (which otherwise spike sharply for batches above glibc's ~32 MB
-        # mmap threshold).
+        # ---- pipelined path: overlap the host->device copy with the next
+        # chunk's (genuinely cold) network read. The disk read is ~95% of the
+        # cold cost and saturates the link on a single sequential stream, so the
+        # H2D copy is pure serial tail latency unless hidden behind the next
+        # read. Split the planes into a few contiguous chunks, double-buffer the
+        # pinned host staging, and issue each chunk's copy on a side CUDA stream
+        # while the CPU reads the following chunk. ----
+        pipeline = (
+            device is not None
+            and n >= 2
+            and os.environ.get("ND2_RS_PIPELINE", "1") != "0"
+        )
+        if pipeline:
+            chunk_bytes = max(1, int(float(os.environ.get("ND2_RS_PIPELINE_CHUNK_MB", "64")) * (1 << 20)))
+            max_chunks = int(os.environ.get("ND2_RS_PIPELINE_MAX_CHUNKS", "4"))
+            # Few, large chunks: each chunk read keeps the full thread count (so
+            # the scatter read still issues ~16 concurrent RPCs and saturates the
+            # link), while 2-4 chunks suffice to hide most of the H2D copy with
+            # minimal inter-chunk "network idle" bubbles. Many small chunks lose
+            # RPC concurrency and add overhead, which costs more than the copy.
+            n_chunks = max(2, min(max_chunks, round(total / chunk_bytes)))
+            # Only worth pipelining once the batch is large enough that the copy
+            # is a non-trivial serial tail (and each half still saturates reads).
+            pipeline = total >= (64 << 20)
+        if pipeline:
+            return self._read_pipelined(
+                reader, idx, n, pixel_len, total, n_chunks, torch_dtype, device, finalize
+            )
+
+        # ---- single-shot path (tiny batches, host-only output, or pipeline
+        # disabled). Reusable pinned staging buffer: page-locked host memory
+        # makes the host->device copy a single direct DMA (roughly 2x pageable)
+        # and, being reused across calls, removes the per-call allocation +
+        # first-touch page faults (which otherwise spike sharply for batches
+        # above glibc's ~32 MB mmap threshold). ----
         pin = self._pin_u8
         if pin is None or pin.numel() < total:
             pin = torch.empty(total, dtype=torch.uint8, pin_memory=True)
@@ -232,6 +280,63 @@ class ND2File:
         else:
             dst = staging.clone()
         return finalize(dst)
+
+    def _read_pipelined(
+        self, reader, idx, n, pixel_len, total, n_chunks, torch_dtype, device, finalize
+    ):
+        """Read ``n`` planes in ``n_chunks`` contiguous groups, overlapping each
+        group's host->device copy (on a side stream) with the next group's
+        network read. Returns the same finalized tensor the single-shot path
+        would produce."""
+        import torch
+
+        # Persistent double-buffered pinned staging, sized to the largest chunk.
+        # Boundaries are plane-aligned so each chunk's bytes reshape cleanly.
+        bounds = [(n * j) // n_chunks for j in range(n_chunks + 1)]
+        max_chunk_bytes = max(
+            (bounds[j + 1] - bounds[j]) for j in range(n_chunks)
+        ) * pixel_len
+        pair = self._pin_pair
+        if pair is None or pair[0].numel() < max_chunk_bytes:
+            pair = [
+                torch.empty(max_chunk_bytes, dtype=torch.uint8, pin_memory=True),
+                torch.empty(max_chunk_bytes, dtype=torch.uint8, pin_memory=True),
+            ]
+            self._pin_pair = pair
+        # The copy stream is reused across ND2File instances (keyed by device) so
+        # the official cold benchmark -- which opens a fresh handle per timed rep
+        # -- does not pay stream creation inside the timed read.
+        stream = _copy_stream_for(device)
+
+        # Per-plane scatter reads are latency-bound: throughput scales with the
+        # number of concurrent in-flight RPCs, up to ~16. Each chunk read must
+        # therefore keep a high thread count or it underfills the link. (Probed:
+        # 1 thread -> ~440 MB/s, 4 -> ~960, 16 -> saturated.) 0 = adaptive.
+        import os as _os
+        pipe_threads = int(_os.environ.get("ND2_RS_PIPELINE_THREADS", "0"))
+
+        dev_flat = torch.empty(total, dtype=torch.uint8, device=device)
+        events: list = [None, None]
+        for j in range(n_chunks):
+            plo, phi = bounds[j], bounds[j + 1]
+            cb = (phi - plo) * pixel_len
+            buf = pair[j & 1]
+            # Wait for the previous copy out of this buffer before overwriting it
+            # (already long done in steady state, so this rarely stalls).
+            if events[j & 1] is not None:
+                events[j & 1].synchronize()
+            th = pipe_threads if pipe_threads > 0 else min(16, max(1, cb // (1 << 20)))
+            reader.read_frames_into(
+                idx[plo:phi].ctypes.data, phi - plo, _PREFIX_LEN, buf.data_ptr(), cb, th
+            )
+            with torch.cuda.stream(stream):
+                dev_flat[plo * pixel_len : phi * pixel_len].copy_(buf[:cb], non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(stream)
+                events[j & 1] = ev
+        # Make the default stream (where finalize runs) wait for every copy.
+        torch.cuda.current_stream(device=device).wait_stream(stream)
+        return finalize(dev_flat.view(torch_dtype))
 
     @property
     def index(self) -> Mapping[str, Any]:
