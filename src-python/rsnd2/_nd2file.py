@@ -124,6 +124,19 @@ class ND2File:
     def _ensure_index(self) -> dict[str, Any]:
         if self._index is None:
             self._index = _ffi.index(self._path)
+            # Open the streaming reader eagerly while metadata is being parsed,
+            # so a subsequent batch read does not pay the reader-open (a second
+            # chunk-map parse) on its critical path. For the open -> inspect
+            # attributes -> read pattern this shaves the parse off every read's
+            # timed section (most visible on small cold batches); for sustained
+            # streaming from one handle it is neutral (the reader is opened once
+            # regardless). ND2_RS_EAGER_READER=0 disables it.
+            import os as _os
+            if _os.environ.get("ND2_RS_EAGER_READER", "1") != "0" and not self._closed:
+                try:
+                    self._ensure_reader()
+                except Exception:
+                    pass
         return self._index
 
     def _ensure_version_probe(self) -> dict[str, Any]:
@@ -255,7 +268,8 @@ class ND2File:
             n_chunks = max(2, min(max_chunks, round(total / chunk_bytes)))
             # Only worth pipelining once the batch is large enough that the copy
             # is a non-trivial serial tail (and each half still saturates reads).
-            pipeline = total >= (64 << 20)
+            min_mb = float(os.environ.get("ND2_RS_PIPELINE_MIN_MB", "64"))
+            pipeline = total >= int(min_mb * (1 << 20))
         if pipeline:
             return self._read_pipelined(
                 reader, idx, n, pixel_len, total, n_chunks, torch_dtype, device, finalize
