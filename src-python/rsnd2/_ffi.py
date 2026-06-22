@@ -76,6 +76,12 @@ def _load() -> ctypes.CDLL:
             fn = getattr(lib, name)
             fn.argtypes = [ctypes.c_char_p]
             fn.restype = ctypes.c_void_p
+        # Optional in older shared libraries; the Python wrapper falls back to
+        # the full index parse when this lightweight (no per-plane) call is absent.
+        meta = getattr(lib, "rsnd2_index_meta_json", None)
+        if meta is not None:
+            meta.argtypes = [ctypes.c_char_p]
+            meta.restype = ctypes.c_void_p
         lib.rsnd2_read_plane_payload.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
         lib.rsnd2_read_plane_payload.restype = _Buffer
         lib.rsnd2_reader_open.argtypes = [ctypes.c_char_p]
@@ -92,6 +98,18 @@ def _load() -> ctypes.CDLL:
             ctypes.c_size_t,            # n_threads
         ]
         lib.rsnd2_reader_read_frames.restype = _Status
+        # Optional in older shared libraries (Linux-only O_DIRECT span read).
+        span = getattr(lib, "rsnd2_reader_read_span_direct", None)
+        if span is not None:
+            span.argtypes = [
+                ctypes.c_void_p,            # handle
+                ctypes.c_uint64,            # offset
+                ctypes.c_size_t,            # len
+                ctypes.c_void_p,            # out_ptr
+                ctypes.c_size_t,            # out_len
+                ctypes.c_size_t,            # n_threads
+            ]
+            span.restype = _Status
         return lib
     detail = "; ".join(errors) if errors else "no compiled library was found"
     raise ImportError(
@@ -139,6 +157,15 @@ def summary(path: str | os.PathLike[str]) -> dict[str, Any]:
 
 def index(path: str | os.PathLike[str]) -> dict[str, Any]:
     return _json_call("rsnd2_index_json", path)
+
+
+def index_meta(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Parse file metadata (attributes, plane_count, chunk counts) without the
+    per-plane record array. Falls back to the full index parse if the native
+    library predates ``rsnd2_index_meta_json``."""
+    if getattr(lib(), "rsnd2_index_meta_json", None) is None:
+        return index(path)
+    return _json_call("rsnd2_index_meta_json", path)
 
 
 def read_plane_payload(path: str | os.PathLike[str], sequence: int) -> bytes:
@@ -205,6 +232,37 @@ class Reader:
             n_threads,
         )
         _raise_status(status)
+
+    def read_span_direct(
+        self,
+        offset: int,
+        length: int,
+        out_ptr: int,
+        out_len: int,
+        n_threads: int,
+    ) -> None:
+        """Read the contiguous span ``[offset, offset+length)`` straight from the
+        device into the page-locked buffer at ``out_ptr`` via ``O_DIRECT``,
+        bypassing the page cache and ZFS ARC. ``offset`` and ``length`` must be
+        4096-aligned and ``out_ptr`` page-aligned."""
+        if self._handle is None:
+            raise ValueError("reader is closed")
+        fn = getattr(lib(), "rsnd2_reader_read_span_direct", None)
+        if fn is None:
+            raise NotImplementedError("native library lacks O_DIRECT span reads")
+        status = fn(
+            self._handle,
+            ctypes.c_uint64(offset),
+            length,
+            ctypes.c_void_p(out_ptr),
+            out_len,
+            n_threads,
+        )
+        _raise_status(status)
+
+    @staticmethod
+    def has_direct() -> bool:
+        return getattr(lib(), "rsnd2_reader_read_span_direct", None) is not None
 
     def close(self) -> None:
         # Clear the handle first so a failure (or re-entry via __del__) can never
