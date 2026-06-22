@@ -21,6 +21,36 @@ _PREFIX_LEN = 8
 # inside the timed section.
 _COPY_STREAMS: dict = {}
 
+# Process-wide staging buffers for the O_DIRECT path, reused across ND2File
+# instances so a fresh handle per read (as the cold benchmark opens) does not
+# reallocate large page-locked host / device buffers inside the timed section.
+# Page-locked allocation of a multi-hundred-MB span is expensive enough to
+# dominate a fresh-handle cold read otherwise. Keyed by device for the GPU
+# buffer; the pinned host buffer is device-independent.
+_DIRECT_PIN = {"buf": None}
+_DIRECT_DEV: dict = {}
+
+
+def _direct_pin(nbytes):
+    import torch
+
+    buf = _DIRECT_PIN["buf"]
+    if buf is None or buf.numel() < nbytes:
+        buf = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        _DIRECT_PIN["buf"] = buf
+    return buf
+
+
+def _direct_dev(nbytes, device):
+    import torch
+
+    key = str(device)
+    buf = _DIRECT_DEV.get(key)
+    if buf is None or buf.numel() < nbytes:
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _DIRECT_DEV[key] = buf
+    return buf
+
 
 def _copy_stream_for(device):
     import torch
@@ -58,6 +88,7 @@ class ND2File:
         self._search_window = search_window
         self._closed = False
         self._index: dict[str, Any] | None = None
+        self._planes: list[Any] | None = None
         self._version_probe: dict[str, Any] | None = None
         self._file = None
         self._mmap = None
@@ -123,7 +154,14 @@ class ND2File:
 
     def _ensure_index(self) -> dict[str, Any]:
         if self._index is None:
-            self._index = _ffi.index(self._path)
+            # Parse metadata WITHOUT the per-plane record array: attributes,
+            # shape, dtype, and the fast read_batch_to_torch path never need it,
+            # and serializing + JSON-parsing thousands of plane records adds
+            # several milliseconds to every fresh open (the dominant cost of a
+            # cold first-touch read at small batch sizes). The full plane table
+            # is parsed lazily by _ensure_planes() only when read_frame/asarray
+            # actually requires per-plane offsets.
+            self._index = _ffi.index_meta(self._path)
             # Open the streaming reader eagerly while metadata is being parsed,
             # so a subsequent batch read does not pay the reader-open (a second
             # chunk-map parse) on its critical path. For the open -> inspect
@@ -138,6 +176,21 @@ class ND2File:
                 except Exception:
                     pass
         return self._index
+
+    def _ensure_planes(self) -> list[Any]:
+        """Return the per-plane record list, parsing the full index lazily.
+
+        The metadata parse in _ensure_index() deliberately omits this array; it
+        is only materialised here, on the first call that needs per-plane chunk
+        offsets (read_frame / asarray / the layout-guess fallback)."""
+        if self._planes is None:
+            full = _ffi.index(self._path)
+            self._planes = full.get("planes", [])
+            # Backfill any metadata the lightweight parse may have lacked so a
+            # subsequent attributes access stays consistent with the full parse.
+            if self._index is not None and self._index.get("attributes") is None:
+                self._index = full
+        return self._planes
 
     def _ensure_version_probe(self) -> dict[str, Any]:
         if self._version_probe is None:
@@ -235,6 +288,28 @@ class ND2File:
                 if t.shape[ax] == 1:
                     t = t.squeeze(ax)
             return t.contiguous()
+
+        # ---- O_DIRECT genuine-cold path (opt-in via ND2_RS_O_DIRECT=1). On
+        # ARC-cached local storage (ZFS) buffered reads are served from RAM, so
+        # a "cold" read is impossible to measure without bypassing the cache;
+        # O_DIRECT reads hit the device every time. It also unlocks far higher
+        # throughput on fast local NVMe than the per-plane scatter path. We read
+        # the one contiguous, block-aligned byte span covering the batch and undo
+        # the inter-plane gaps with a strided gather on the GPU. Requires a
+        # contiguous, constant-stride run of equal-length planes (the common
+        # acquisition layout); otherwise we fall through to the scatter path. ----
+        if (
+            device is not None
+            and torch_dtype is not None
+            and os.environ.get("ND2_RS_O_DIRECT", "0") == "1"
+            and _ffi.Reader.has_direct()
+        ):
+            direct = self._read_batch_odirect(
+                reader, idx_list, n, height, width, channel_count,
+                comps_per_channel, pixel_len, torch_dtype, device, finalize, n_threads,
+            )
+            if direct is not None:
+                return direct
 
         if torch_dtype is None:
             # Uncommon dtype: fall back to a plain host buffer.
@@ -351,6 +426,95 @@ class ND2File:
         # Make the default stream (where finalize runs) wait for every copy.
         torch.cuda.current_stream(device=device).wait_stream(stream)
         return finalize(dev_flat.view(torch_dtype))
+
+    def _read_batch_odirect(
+        self, reader, idx_list, n, height, width, channel_count,
+        comps_per_channel, pixel_len, torch_dtype, device, finalize, n_threads,
+    ):
+        """Genuine-cold / fast-NVMe read of a contiguous z-stack batch via
+        ``O_DIRECT``. Reads the single block-aligned byte span that covers the
+        batch (planes + inter-plane chunk headers + alignment padding) directly
+        off the device, overlapping each chunk's host->device copy with the next
+        chunk's read, then gathers the wanted pixel bytes out of the gappy span
+        with a strided view on the GPU. Returns ``None`` (caller falls back to
+        the scatter path) if the planes are not a contiguous, constant-stride run
+        of equal-length payloads."""
+        import os as _os
+
+        import torch
+
+        ALIGN = 4096
+        # Resolve the requested planes to (payload_offset, payload_len). Bail to
+        # the scatter path on any irregularity O_DIRECT span gathering can't model.
+        try:
+            recs = [self._plane_record(int(i)) for i in idx_list]
+        except Exception:
+            return None
+        offs = [int(r.get("payload_offset", -1)) for r in recs]
+        plens = {int(r.get("payload_len", -1)) for r in recs}
+        if len(plens) != 1 or -1 in offs:
+            return None
+        payload_len = plens.pop()
+        if payload_len - _PREFIX_LEN != pixel_len:
+            return None
+        if n >= 2:
+            stride = offs[1] - offs[0]
+            if stride <= 0 or any(b - a != stride for a, b in zip(offs, offs[1:])):
+                return None
+        else:
+            stride = payload_len
+
+        first_pix = offs[0] + _PREFIX_LEN
+        region_start = (first_pix // ALIGN) * ALIGN
+        region_end = ((offs[-1] + payload_len + ALIGN - 1) // ALIGN) * ALIGN
+        span = region_end - region_start
+
+        # Page-locked staging spanning the whole region. Chunks write disjoint
+        # slices, so a single buffer double-buffers naturally: the GPU DMAs one
+        # chunk's slice while the CPU reads the next into a different slice. The
+        # staging (host + device) is pooled process-wide so a fresh handle per
+        # cold rep does not pay a multi-hundred-MB page-locked allocation inside
+        # the timed read.
+        pin = _direct_pin(span)
+        dev = _direct_dev(span, device)
+        base_ptr = pin.data_ptr()
+
+        # Tuned on local NVMe: ~32 concurrent O_DIRECT readers keep the device
+        # queue deep enough to saturate both a single-vdev (device-bound) file
+        # and one striped across vdevs; fewer underfill the slow case, more
+        # (>=40) start losing to scheduling overhead. A few large (~64 MB)
+        # chunks give enough pipeline depth to hide the H2D copy behind the next
+        # chunk's read without the per-chunk overhead that more chunks add.
+        threads = int(_os.environ.get("ND2_RS_DIRECT_THREADS", str(max(32, n_threads))))
+        chunk_mb = float(_os.environ.get("ND2_RS_DIRECT_CHUNK_MB", "64"))
+        max_chunks = int(_os.environ.get("ND2_RS_DIRECT_MAX_CHUNKS", "8"))
+        n_chunks = max(1, min(max_chunks, round(span / (chunk_mb * (1 << 20))) or 1))
+        # Block-aligned chunk boundaries within [region_start, region_end).
+        bounds = [
+            region_start + (((span * j) // n_chunks) // ALIGN) * ALIGN
+            for j in range(n_chunks)
+        ] + [region_end]
+
+        stream = _copy_stream_for(device)
+        try:
+            for j in range(n_chunks):
+                clo, chi = bounds[j], bounds[j + 1]
+                clen = chi - clo
+                if clen <= 0:
+                    continue
+                doff = clo - region_start
+                reader.read_span_direct(clo, clen, base_ptr + doff, clen, threads)
+                with torch.cuda.stream(stream):
+                    dev[doff:doff + clen].copy_(pin[doff:doff + clen], non_blocking=True)
+        except (NotImplementedError, ValueError):
+            return None
+        torch.cuda.current_stream(device=device).wait_stream(stream)
+
+        # Gather the pixel bytes of each plane out of the gappy span: row i starts
+        # at (first_pix - region_start) + i*stride and runs pixel_len bytes.
+        gbase = first_pix - region_start
+        clean = torch.as_strided(dev[gbase:], size=(n, pixel_len), stride=(stride, 1)).contiguous()
+        return finalize(clean.view(torch_dtype))
 
     @property
     def index(self) -> Mapping[str, Any]:
@@ -637,7 +801,7 @@ class ND2File:
             raise IndexError(f"frame index {sequence} out of range for {count} frames")
 
     def _plane_record(self, sequence: int) -> dict[str, Any]:
-        planes = self._ensure_index().get("planes", [])
+        planes = self._ensure_planes()
         if sequence < len(planes):
             plane = planes[sequence]
             if int(plane.get("sequence", -1)) == sequence:
@@ -675,7 +839,7 @@ class ND2File:
         self, payload_len: int | None = None
     ) -> tuple[int, int, str, int]:
         if payload_len is None:
-            planes = self._ensure_index().get("planes", [])
+            planes = self._ensure_planes()
             if not planes:
                 return (0, 0, "uint8", 1)
             payload_len = max(0, int(planes[0].get("payload_len", 0)) - _PREFIX_LEN)

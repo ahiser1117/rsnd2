@@ -10,6 +10,19 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
+/// `O_DIRECT` (Linux). Hardcoded to keep the crate dependency-free. Reads on an
+/// `O_DIRECT` handle bypass the OS page cache *and* the ZFS ARC, so each read
+/// genuinely hits the backing device -- essential for measuring a true cold
+/// (first-touch) read on ARC-cached local storage, where `posix_fadvise`
+/// (DONTNEED) does not evict the ARC.
+#[cfg(target_os = "linux")]
+const O_DIRECT_FLAG: i32 = 0o40000;
+
+/// Direct-IO block alignment. `O_DIRECT` requires the file offset, byte count,
+/// and destination buffer to all be multiples of the device logical block;
+/// 4096 satisfies every common NVMe/SSD and the ZFS page-aligned direct path.
+pub const DIRECT_IO_ALIGN: u64 = 4096;
+
 const MODERN_MAGIC: [u8; 4] = [0xda, 0xce, 0xbe, 0x0a];
 const LEGACY_MAGIC: [u8; 4] = [0x6a, 0x50, 0x20, 0x20];
 const CHUNK_MAP_SIGNATURE: &[u8] = b"ND2 CHUNK MAP SIGNATURE 0000001!";
@@ -348,6 +361,102 @@ impl Nd2Reader {
 
     pub fn index(&self) -> &Nd2Index {
         &self.index
+    }
+
+    /// Read the contiguous byte span `[offset, offset+len)` straight from the
+    /// backing device into `out`, bypassing the page cache and ZFS ARC via
+    /// `O_DIRECT`. `offset` and `len` must be multiples of [`DIRECT_IO_ALIGN`]
+    /// and `out` must be at least `len` bytes and 4096-aligned (page-locked
+    /// host memory always is). Up to `n_threads` aligned sub-spans are read
+    /// concurrently, which is what lets a single file saturate fast local NVMe.
+    ///
+    /// The span typically covers many planes plus the inter-plane chunk headers
+    /// and a little alignment padding; the caller reshapes the wanted pixel
+    /// bytes out of it (e.g. a strided gather on the GPU). Reads that run into
+    /// EOF return short and stop cleanly, leaving the unused alignment tail
+    /// untouched.
+    #[cfg(all(unix, target_os = "linux"))]
+    pub fn read_span_direct(
+        &self,
+        offset: u64,
+        len: usize,
+        out: &mut [u8],
+        n_threads: usize,
+    ) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if offset % DIRECT_IO_ALIGN != 0 || (len as u64) % DIRECT_IO_ALIGN != 0 {
+            return Err(Nd2Error::Invalid(format!(
+                "O_DIRECT span must be {DIRECT_IO_ALIGN}-aligned (offset={offset}, len={len})"
+            )));
+        }
+        if out.len() < len {
+            return Err(Nd2Error::Invalid(format!(
+                "output buffer is {} bytes but span needs {len}",
+                out.len()
+            )));
+        }
+        if (out.as_ptr() as usize) % DIRECT_IO_ALIGN as usize != 0 {
+            return Err(Nd2Error::Invalid(
+                "O_DIRECT destination buffer is not 4096-aligned".to_string(),
+            ));
+        }
+        let file_size = self.index.file_size;
+        let direct = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_DIRECT_FLAG)
+            .open(&self.index.path)?;
+
+        let out = &mut out[..len];
+        let threads = n_threads.clamp(1, 64);
+        // Partition into `threads` contiguous, block-aligned sub-spans. Every
+        // boundary stays a multiple of DIRECT_IO_ALIGN so each thread issues
+        // only aligned O_DIRECT reads into an aligned slice of `out`.
+        let blocks = (len as u64) / DIRECT_IO_ALIGN;
+        let per_blocks = blocks.div_ceil(threads as u64);
+        let mut ranges: Vec<(u64, usize)> = Vec::new();
+        let mut b = 0u64;
+        while b < blocks {
+            let nb = per_blocks.min(blocks - b);
+            let sub_off = offset + b * DIRECT_IO_ALIGN;
+            let sub_len = (nb * DIRECT_IO_ALIGN) as usize;
+            ranges.push((sub_off, sub_len));
+            b += nb;
+        }
+
+        let mut slices: Vec<(&mut [u8], u64)> = Vec::new();
+        let mut remaining: &mut [u8] = out;
+        for (sub_off, sub_len) in &ranges {
+            let (head, tail) = remaining.split_at_mut(*sub_len);
+            slices.push((head, *sub_off));
+            remaining = tail;
+        }
+
+        let direct = &direct;
+        let mut first_err: Option<Nd2Error> = None;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = slices
+                .into_iter()
+                .map(|(slice, sub_off)| {
+                    scope.spawn(move || -> Result<()> {
+                        read_direct_range(direct, slice, sub_off, file_size)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                match handle.join() {
+                    Ok(Err(err)) if first_err.is_none() => first_err = Some(err),
+                    Err(_) if first_err.is_none() => {
+                        first_err = Some(Nd2Error::Invalid("direct reader thread panicked".into()))
+                    }
+                    _ => {}
+                }
+            }
+        });
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn plane_for(&self, sequence: usize) -> Result<&PlaneRecord> {
@@ -1067,6 +1176,21 @@ pub extern "C" fn rsnd2_index_json(path: *const c_char) -> *mut c_char {
     })
 }
 
+/// Like `rsnd2_index_json` but omits the (potentially large) per-plane records
+/// array, emitting an empty `planes` list while still reporting `plane_count`,
+/// `attributes`, and chunk metadata. Serializing and JSON-parsing every plane
+/// record costs several milliseconds for files with thousands of planes; the
+/// fast `read_batch_to_torch` path needs only the attributes, so this lets the
+/// Python wrapper skip that work and parse the full plane table lazily (only
+/// when `read_frame`/`asarray` is actually used).
+#[unsafe(no_mangle)]
+pub extern "C" fn rsnd2_index_meta_json(path: *const c_char) -> *mut c_char {
+    ffi_string_result(path, |path| {
+        let index = Nd2Index::open(path)?;
+        Ok(index_meta_json(&index))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rsnd2_read_plane_payload(path: *const c_char, sequence: usize) -> Nd2Buffer {
     let result = ffi_path(path).and_then(|path| {
@@ -1194,6 +1318,49 @@ pub extern "C" fn rsnd2_reader_read_frames(
     }
 }
 
+/// Read the contiguous, block-aligned byte span `[offset, offset+len)` directly
+/// from the device into `out_ptr` via `O_DIRECT` (bypassing page cache + ARC).
+/// `offset`/`len` must be 4096-aligned and `out_ptr` page-aligned. Only built
+/// on Linux; other targets return an error so callers can fall back.
+#[unsafe(no_mangle)]
+pub extern "C" fn rsnd2_reader_read_span_direct(
+    handle: *mut c_void,
+    offset: u64,
+    len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+    n_threads: usize,
+) -> Nd2Status {
+    if handle.is_null() {
+        return Nd2Status::err("reader handle is null");
+    }
+    if out_ptr.is_null() && out_len > 0 {
+        return Nd2Status::err("output buffer pointer is null");
+    }
+    if out_len < len {
+        return Nd2Status::err("output buffer is smaller than the requested span");
+    }
+    let reader = unsafe { &*(handle as *const Nd2Reader) };
+    let out = if out_len == 0 {
+        &mut [][..]
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) }
+    };
+    let threads = if n_threads == 0 { 1 } else { n_threads };
+    #[cfg(all(unix, target_os = "linux"))]
+    {
+        match reader.read_span_direct(offset, len, out, threads) {
+            Ok(()) => Nd2Status::ok(),
+            Err(err) => Nd2Status::err(format!("{err}")),
+        }
+    }
+    #[cfg(not(all(unix, target_os = "linux")))]
+    {
+        let _ = (out, threads, offset, len);
+        Nd2Status::err("O_DIRECT span reads are only implemented on Linux")
+    }
+}
+
 fn ffi_string_result<F>(path: *const c_char, f: F) -> *mut c_char
 where
     F: FnOnce(&Path) -> Result<String>,
@@ -1279,6 +1446,21 @@ fn index_json(index: &Nd2Index) -> String {
         index.planes.len(),
         json_image_attributes(index.attributes.as_ref()),
         planes,
+    )
+}
+
+fn index_meta_json(index: &Nd2Index) -> String {
+    format!(
+        "{{\"path\":{},\"file_size\":{},\"variant\":{},\"signature_version\":{},\"filemap_offset\":{},\"chunk_count\":{},\"chunk_name_counts\":{},\"plane_count\":{},\"attributes\":{},\"planes\":[]}}",
+        json_string(&index.path.display().to_string()),
+        index.file_size,
+        json_string(variant_name(index.variant)),
+        json_option_string(index.signature_version.as_deref()),
+        json_option_u64(index.filemap_offset),
+        index.chunk_count,
+        json_counts(&index.chunk_name_counts),
+        index.planes.len(),
+        json_image_attributes(index.attributes.as_ref()),
     )
 }
 
@@ -1371,6 +1553,32 @@ fn json_string(value: &str) -> String {
 }
 
 #[cfg(unix)]
+/// Fill `slice` from `file` (an `O_DIRECT` handle) starting at byte `offset`,
+/// using block-aligned positional reads. `offset` and `slice.len()` are assumed
+/// to be 4096-aligned, and `slice` is page-aligned, so each `read_at` keeps the
+/// offset/buffer/count alignment `O_DIRECT` demands. A read that runs into
+/// `file_size` returns short; we stop there, leaving the trailing alignment
+/// padding (never part of any plane's pixels) untouched.
+#[cfg(all(unix, target_os = "linux"))]
+fn read_direct_range(file: &File, slice: &mut [u8], offset: u64, file_size: u64) -> Result<()> {
+    const STEP: usize = 1 << 20; // 1 MiB, a multiple of DIRECT_IO_ALIGN
+    let mut done = 0usize;
+    let total = slice.len();
+    while done < total {
+        let cur = offset + done as u64;
+        if cur >= file_size {
+            break; // only alignment padding past EOF remains
+        }
+        let want = STEP.min(total - done);
+        let n = file.read_at(&mut slice[done..done + want], cur)?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+    }
+    Ok(())
+}
+
 fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
         let n = file.read_at(buf, offset)?;

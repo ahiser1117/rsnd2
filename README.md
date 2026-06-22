@@ -43,8 +43,12 @@ tensor of shape `(batch × z_per_frame, C, Y, X)`.
   batch of *B* z-stacks reads *B × 80* contiguous z-slices.
 - **Warm:** the file is resident in cache — the steady-state regime for an ML
   data loader on a large-RAM host.
-- **Cold:** the client page cache is dropped (`posix_fadvise(DONTNEED)`) before
-  every timed read, so the read comes from the backing store.
+- **Cold:** a genuine *first-touch* read, with the file open + metadata parse
+  **inside** the timed section. `rsnd2` reads the pixels with `O_DIRECT`, which
+  bypasses both the OS page cache **and** the ZFS ARC and goes straight to the
+  device. (Dropping the page cache with `posix_fadvise(DONTNEED)` is enough on a
+  plain filesystem, but **not** on ZFS — the ARC can only be evicted as root, so
+  a buffered "cold" read there is really served from RAM.)
 - Time is end-to-end and includes the host→device (PCIe) transfer and the layout
   transform, not just the disk read.
 
@@ -73,60 +77,79 @@ workspace (`gpu_stream_bench.py`, `results/RESULTS.md`).
 
 Test host on a single 10 GbE NFS4 mount (no `nconnect`, `rsize=1 MB`).
 
-| cache | batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | speedup |
-| --- | --- | --- | --- | --- | --- |
-| warm | 1 | 80 | 27.23 | 1.739 | 15.7× |
-| warm | 2 | 160 | 54.42 | 3.052 | 17.8× |
-| warm | 4 | 320 | 109.82 | 5.884 | 18.7× |
-| warm | 8 | 640 | 226.10 | 11.883 | **19.0×** |
-| warm | 16 | 1280 | 455.40 | 23.694 | 19.2× |
-| cold | 1 | 80 | 104.17 | 22.392 | 4.7× |
-| cold | 2 | 160 | 161.33 | 42.927 | 3.8× |
-| cold | 4 | 320 | 318.85 | 85.338 | 3.7× |
-| cold | 8 | 640 | 666.95 | 169.855 | **3.9×** |
-| cold | 16 | 1280 | 1315.25 | 336.752 | 3.9× |
+| cache | batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | speedup | `rsnd2` GB/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| warm | 1 | 80 | 27.4 | 1.74 | 15.8× | 12.6 |
+| warm | 8 | 640 | 216.1 | 9.71 | 22.3× | 18.0 |
+| warm | 16 | 1280 | 447.6 | 18.84 | **23.8×** | 18.6 |
+| warm | 32 | 2560 | 916.0 | 39.57 | 23.2× | 17.7 |
+| warm | 60 | 4800 | 1707.4 | 72.62 | 23.5× | 18.0 |
+| cold | 1 | 80 | 173.1 | 35.31 | 4.9× | 0.62 |
+| cold | 8 | 640 | 842.1 | 177.4 | 4.8× | 0.99 |
+| cold | 16 | 1280 | 1637.1 | 353.0 | 4.6× | 0.99 |
+| cold | 32 | 2560 | 3292.4 | 695.4 | 4.7× | 1.01 |
+| cold | 60 | 4800 | 6170.4 | 1277.3 | **4.8×** | 1.03 |
 
-Warm is ~19× faster — largely fixed-overhead amortization: PyPI `nd2` reads each
+Warm is ~23× faster — largely fixed-overhead amortization: PyPI `nd2` reads each
 z-slice individually, while `rsnd2` packs the whole z-stack batch in one Rust
-call. Cold reads saturate the single-client NFS link (~1.1 GB/s on 10 GbE), so
-both readers hit the same network ceiling and the ratio is ~3.7–4.7×. The cold
-streaming path was further tuned (the batch read is split into a few large,
-plane-aligned chunks whose host→device copies overlap the next chunk's read, and
-the reader is opened during metadata parse), recovering ~3–4% toward the network
-ceiling — see `rsnd2-testing/results/RESULTS.md`.
+call. Cold reads saturate the single-client NFS link (**~1.0–1.1 GB/s on
+10 GbE**), so both readers hit the same network ceiling and the ratio is ~4.6–4.9×.
+Here the cold pixels are read with `O_DIRECT` (a genuine over-the-wire read, not
+a client-cache hit) and the timed section includes the cold open + metadata
+parse; the `rsnd2` open was also made cheaper by parsing file metadata without
+materialising the full per-plane table (≈12 ms → ≈3 ms cold open). See
+`rsnd2-testing/results/RESULTS.md`.
 
 ![NFS disk→GPU z-stack streaming: rsnd2 vs PyPI nd2](docs/zstack_streaming.png)
 
 ### Local storage (NVMe, ZFS)
 
-Same files copied to a local NVMe-backed ZFS dataset.
+Same files copied to a local NVMe-backed ZFS dataset. Batch sizes extend to 60
+z-stacks (the whole file), where throughput is highest.
 
-| cache | batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | speedup | `rsnd2` GB/s |
-| --- | --- | --- | --- | --- | --- | --- |
-| warm | 1 | 80 | 29.5 | 1.83 | 16× | 11.9 |
-| warm | 2 | 160 | 59.3 | 2.96 | 20× | 14.8 |
-| warm | 4 | 320 | 115.3 | 5.21 | 22× | 16.8 |
-| warm | 8 | 640 | 226.1 | 9.77 | **23×** | 17.9 |
-| warm | 16 | 1280 | 453.8 | 19.38 | 23× | 18.0 |
-| cold | 1 | 80 | 71.5 | 2.03 | 35× | 10.7 |
-| cold | 2 | 160 | 140.9 | 3.18 | 44× | 13.7 |
-| cold | 4 | 320 | 276.4 | 5.36 | 52× | 16.3 |
-| cold | 8 | 640 | 544.8 | 9.86 | **55×** | 17.7 |
-| cold | 16 | 1280 | 1090.5 | 19.58 | 56× | 17.9 |
+**Warm — cache-resident steady state** (the regime an ML data loader runs in
+once files are hot in the ARC):
 
-On local storage `rsnd2` sustains **~18 GB/s** and is **16–23× faster warm** and
-**35–56× faster cold** than PyPI `nd2`. Two local-specific notes:
+| batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | `rsnd2` GB/s | speedup |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 80 | 29.9 | 1.83 | 11.9 | 16.3× |
+| 8 | 640 | 246 | 9.55 | 18.3 | 25.6× |
+| 16 | 1280 | 479 | 18.3 | 19.1 | 26.3× |
+| 32 | 2560 | 932 | 36.4 | 19.2 | 25.6× |
+| 60 | 4800 | 1771 | 66.2 | 19.8 | **26.7×** |
 
-- **ZFS ARC cannot be evicted via `posix_fadvise(DONTNEED)`** (it needs root
-  `drop_caches`), so "cold" here is *page-cache-dropped but ARC-resident*
-  (RAM-served), not a genuine first-touch from NVMe. This is the realistic local
-  steady state once data is hot in ARC.
-- The much larger **cold** speedup is because PyPI `nd2`'s mmap-based per-frame
-  reads re-fault every page when the page cache is dropped (1.09 s at batch 16),
-  whereas `rsnd2`'s `pread`-based reader serves straight from ARC.
-- At this speed the bottleneck has moved off storage onto the **PCIe host→device
-  copy (~26 GB/s)**: for large batches the H2D copy, not the read, is the long
-  pole — analogous to the 10 GbE ceiling in the NFS case.
+Warm `rsnd2` sustains **~20 GB/s** and is **16–27× faster** than PyPI `nd2`
+(which reads each z-slice in a separate Python call). At this rate the bottleneck
+is the **PCIe host→device copy (~20–25 GB/s)**, not the read.
+
+**Cold — genuine first-touch from NVMe** (`rsnd2` with `O_DIRECT`, mean of 3
+files):
+
+| batch (z-stacks) | z-slices | `rsnd2` GB/s (cold) |
+| --- | --- | --- |
+| 1 | 80 | 1.6 |
+| 8 | 640 | 5.5 |
+| 16 | 1280 | 7.5 |
+| 32 | 2560 | 9.1 |
+| 60 | 4800 | **10.7** |
+
+Measuring a genuine cold read on this pool is subtle, and the previous "local"
+benchmark got it wrong:
+
+- **ZFS caches in the ARC, which `posix_fadvise(DONTNEED)` cannot evict.** A
+  buffered "cold" read is served from RAM, not the device — an earlier run
+  reported ARC-resident reads (~18 GB/s, cold ≈ warm) as "cold".
+- `rsnd2`'s cold path reads with **`O_DIRECT`**, which bypasses the page cache
+  and the ARC and goes to the device (on an ARC miss). Genuine cold device
+  throughput is **~1.6 GB/s (batch 1) → ~10.7 GB/s (whole-file batch)**. The
+  per-file spread is physical NVMe placement — one file striped across both
+  vdevs reads at ~15 GB/s, two on a single vdev at ~8 GB/s — not a software
+  limit. PyPI `nd2` has no `O_DIRECT` path, so its cold reads cannot be separated
+  from the ARC and are not a genuine first-touch comparison.
+- Caveat: `O_DIRECT` only bypasses the ARC on a *miss*, so a genuine number needs
+  the file uncached (truly fresh, or a root ARC drop). At large batch the path is
+  H2D-PCIe-bound, so the end-to-end rate alone cannot prove a read was cold —
+  the harness flags reads returning at RAM speed.
 
 ![Local NVMe/ZFS disk→GPU z-stack streaming: rsnd2 vs PyPI nd2](docs/local_nvme_streaming.png)
 
