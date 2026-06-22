@@ -32,27 +32,46 @@ arr = rsnd2.imread("path/to/file.nd2")
 ## Comparison with the PyPI `nd2` package
 
 `rsnd2` is benchmarked against the upstream [`nd2`](https://pypi.org/project/nd2/)
-package on the disk→GPU batch-streaming path: the end-to-end time to stream a
-batch of **z-stacks** into a contiguous CUDA tensor. A single plane returned by
-`read_frame(i)` is one z-slice (what PyPI `nd2` calls a "frame"); the acquisition
-unit is a z-stack of `z_per_frame` z-slices (default 80), so a batch of *B*
-reads *B × 80* contiguous z-slices. Test data is 3× real ND2 files (4800
-z-slices each = 60 z-stacks of 80; `80×2×212×322` uint16 per z-stack, on NFS)
-read on an RTX 6000 Ada. The harness runs both readers in separate subprocesses
-(both packages import as `nd2`). The full workspace lives alongside this repo in
-`../nd2-pypi-comparison`; see `../nd2-pypi-comparison/results/RESULTS.md` for the
-complete write-up.
+package on the **disk→GPU batch-streaming** path: the end-to-end wall time to
+stream a batch of z-stacks from an `.nd2` file into one contiguous `torch.cuda`
+tensor of shape `(batch × z_per_frame, C, Y, X)`.
 
-### Headline (batch = 8 z-stacks = 640 z-slices)
+### What is measured
 
-- **Warm / sustained streaming: 19.0× faster** (226.1 ms → 11.88 ms) — the
-  steady-state regime for an ML data loader on a large-RAM host. The warm
-  speedup grows with batch size and plateaus around 19×.
-- **Cold / first-touch from NFS: 3.9× faster** (667.0 ms → 169.9 ms), at the NFS
-  single-client bandwidth ceiling (~1 GB/s). The cold ratio holds ~3.7–4.7×
-  across batch sizes and varies run-to-run with PyPI's single-stream speed.
+- A **z-slice** is one plane returned by `read_frame(i)` (what PyPI `nd2` calls a
+  "frame"). A **z-stack** is `z_per_frame` contiguous z-slices (default 80), so a
+  batch of *B* z-stacks reads *B × 80* contiguous z-slices.
+- **Warm:** the file is resident in cache — the steady-state regime for an ML
+  data loader on a large-RAM host.
+- **Cold:** the client page cache is dropped (`posix_fadvise(DONTNEED)`) before
+  every timed read, so the read comes from the backing store.
+- Time is end-to-end and includes the host→device (PCIe) transfer and the layout
+  transform, not just the disk read.
 
-### All batch sizes
+### Assumptions
+
+- **Fair end-to-end path.** `rsnd2` uses `read_batch_to_torch` (one packed Rust
+  read of the whole batch, then a single pinned host→device copy, with the copy
+  pipelined behind the read); PyPI `nd2` uses `np.stack([read_frame(i) …])`
+  followed by one host→device copy. Both produce a byte-identical CUDA tensor.
+- **File format = the fast path:** modern chunked ND2, uncompressed, with packed
+  (unpadded) rows. Compressed or legacy-JPEG2000 files take a slower fallback and
+  are not represented by these numbers.
+- **One client, one GPU** (RTX 6000 Ada), GPU otherwise idle; both readers run in
+  separate subprocesses (both distributions import as `nd2`).
+- **Test data:** 3× real ND2 files, 4800 z-slices each (60 z-stacks of 80),
+  `80×2×212×322` uint16 per z-stack (~21.8 MB). Reported values are the **mean
+  across the 3 files**.
+- Cold throughput is **storage-bandwidth-bound**, so the speedup over PyPI `nd2`
+  depends on the medium (see the two cases below). Warm throughput is bound by
+  host memory / PCIe and by PyPI's per-frame Python overhead.
+
+The benchmark harness and full write-up live in the sibling `rsnd2-testing/`
+workspace (`gpu_stream_bench.py`, `results/RESULTS.md`).
+
+### Networked storage (NFS, single 10 GbE link)
+
+Test host on a single 10 GbE NFS4 mount (no `nconnect`, `rsize=1 MB`).
 
 | cache | batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | speedup |
 | --- | --- | --- | --- | --- | --- |
@@ -67,17 +86,54 @@ complete write-up.
 | cold | 8 | 640 | 666.95 | 169.855 | **3.9×** |
 | cold | 16 | 1280 | 1315.25 | 336.752 | 3.9× |
 
-`rsnd2` values are means across the final-build (Opt C) measurement runs over the
-3 files. The warm advantage is largely fixed-overhead amortization: PyPI `nd2`
-reads each z-slice individually, while `rsnd2` packs the whole z-stack batch in
-one Rust call. Cold reads are bounded by single-client NFS bandwidth.
+Warm is ~19× faster — largely fixed-overhead amortization: PyPI `nd2` reads each
+z-slice individually, while `rsnd2` packs the whole z-stack batch in one Rust
+call. Cold reads saturate the single-client NFS link (~1.1 GB/s on 10 GbE), so
+both readers hit the same network ceiling and the ratio is ~3.7–4.7×. The cold
+streaming path was further tuned (the batch read is split into a few large,
+plane-aligned chunks whose host→device copies overlap the next chunk's read, and
+the reader is opened during metadata parse), recovering ~3–4% toward the network
+ceiling — see `rsnd2-testing/results/RESULTS.md`.
 
-![z-stack disk→GPU streaming: rsnd2 vs PyPI nd2](../nd2-pypi-comparison/results/zstack_streaming.png)
+![NFS disk→GPU z-stack streaming: rsnd2 vs PyPI nd2](docs/zstack_streaming.png)
+
+### Local storage (NVMe, ZFS)
+
+Same files copied to a local NVMe-backed ZFS dataset.
+
+| cache | batch (z-stacks) | z-slices | PyPI `nd2` (ms) | `rsnd2` (ms) | speedup | `rsnd2` GB/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| warm | 1 | 80 | 29.5 | 1.83 | 16× | 11.9 |
+| warm | 2 | 160 | 59.3 | 2.96 | 20× | 14.8 |
+| warm | 4 | 320 | 115.3 | 5.21 | 22× | 16.8 |
+| warm | 8 | 640 | 226.1 | 9.77 | **23×** | 17.9 |
+| warm | 16 | 1280 | 453.8 | 19.38 | 23× | 18.0 |
+| cold | 1 | 80 | 71.5 | 2.03 | 35× | 10.7 |
+| cold | 2 | 160 | 140.9 | 3.18 | 44× | 13.7 |
+| cold | 4 | 320 | 276.4 | 5.36 | 52× | 16.3 |
+| cold | 8 | 640 | 544.8 | 9.86 | **55×** | 17.7 |
+| cold | 16 | 1280 | 1090.5 | 19.58 | 56× | 17.9 |
+
+On local storage `rsnd2` sustains **~18 GB/s** and is **16–23× faster warm** and
+**35–56× faster cold** than PyPI `nd2`. Two local-specific notes:
+
+- **ZFS ARC cannot be evicted via `posix_fadvise(DONTNEED)`** (it needs root
+  `drop_caches`), so "cold" here is *page-cache-dropped but ARC-resident*
+  (RAM-served), not a genuine first-touch from NVMe. This is the realistic local
+  steady state once data is hot in ARC.
+- The much larger **cold** speedup is because PyPI `nd2`'s mmap-based per-frame
+  reads re-fault every page when the page cache is dropped (1.09 s at batch 16),
+  whereas `rsnd2`'s `pread`-based reader serves straight from ARC.
+- At this speed the bottleneck has moved off storage onto the **PCIe host→device
+  copy (~26 GB/s)**: for large batches the H2D copy, not the read, is the long
+  pole — analogous to the 10 GbE ceiling in the NFS case.
+
+![Local NVMe/ZFS disk→GPU z-stack streaming: rsnd2 vs PyPI nd2](docs/local_nvme_streaming.png)
 
 ### Correctness
 
 Pixel data is byte-for-byte identical to PyPI `nd2`: blake2b hashes matched for
-all 30/30 batch/file/cache cases in the run above. The batch layout mirrors
+all batch/file/cache cases in both runs above. The batch layout mirrors
 `read_frame` exactly, verified for single-channel, multi-channel, and RGB.
 
 ## Command-line interface
